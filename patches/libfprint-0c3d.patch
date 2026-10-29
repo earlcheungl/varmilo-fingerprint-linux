@@ -1,0 +1,196 @@
+diff -ruN a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+--- a/libfprint/drivers/elan.c	2026-10-30 00:21:13.789490406 +0800
++++ b/libfprint/drivers/elan.c	2026-10-30 00:21:13.790143900 +0800
+@@ -40,6 +40,7 @@
+ 
+ #include "drivers_api.h"
+ #include "elan.h"
++#include <stdio.h>
+ 
+ static unsigned char
+ elan_get_pixel (struct fpi_frame_asmbl_ctx *ctx,
+@@ -78,6 +79,8 @@
+   unsigned char  *last_read;
+   unsigned char   calib_atts_left;
+   unsigned char   calib_status;
++  unsigned short  calib_mean;
++  unsigned char   bg_attempts;
+   unsigned short *background;
+   unsigned char   frame_width;
+   unsigned char   frame_height;
+@@ -332,7 +335,33 @@
+   g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
+   fpi_do_movement_estimation (&assembling_ctx, frames);
+   img = fpi_assemble_frames (&assembling_ctx, frames);
+-  img->flags |= FPI_IMAGE_PARTIAL;
++
++  /* NBIS removes every minutia close to the image border when the image is
++   * marked as partial, and a swipe image is almost entirely border. Keep the
++   * flag off so the matcher sees the minutiae we do have. */
++  if (g_getenv ("ELAN_MARK_PARTIAL"))
++    img->flags |= FPI_IMAGE_PARTIAL;
++
++  if (g_getenv ("ELAN_DUMP_DIR"))
++    {
++      static guint dump_no = 0;
++      gsize len = 0;
++      const guchar *data = fp_image_get_data (img, &len);
++      guint w = fp_image_get_width (img), h = fp_image_get_height (img);
++      gchar *path = g_strdup_printf ("%s/elan-%03u-%ux%u.pgm",
++                                     g_getenv ("ELAN_DUMP_DIR"),
++                                     dump_no++, w, h);
++      FILE *fp = fopen (path, "wb");
++
++      if (fp)
++        {
++          fprintf (fp, "P5\n%u %u\n255\n", w, h);
++          fwrite (data, 1, MIN (len, (gsize) w * h), fp);
++          fclose (fp);
++        }
++      fp_dbg ("dumped image to %s", path);
++      g_free (path);
++    }
+ 
+   g_slist_free_full (frames, g_free);
+ 
+@@ -677,13 +706,20 @@
+   fp_dbg ("calibration mean: %d, bg mean: %d, delta: %d", calib_mean,
+           bg_mean, delta);
+ 
+-  return delta > ELAN_CALIBRATION_MAX_DELTA ? 1 : 0;
++  /* Custom build for the ELAN 04f3:0c3d inside a Varmilo keyboard: its own
++   * calibration never finishes (the status register stays at 0x01), so asking
++   * the device to calibrate always aborts enrollment with "Calibration
++   * failed!". The background captured right before each capture is good
++   * enough for image processing, so never request device calibration. */
++  return 0;
+ }
+ 
+ enum calibrate_states {
++  CALIBRATE_GET_MEAN,
++  CALIBRATE_STORE_MEAN,
+   CALIBRATE_GET_BACKGROUND,
++  CALIBRATE_CHECK_BACKGROUND,
+   CALIBRATE_SAVE_BACKGROUND,
+-  CALIBRATE_GET_MEAN,
+   CALIBRATE_CHECK_NEEDED,
+   CALIBRATE_GET_STATUS,
+   CALIBRATE_CHECK_STATUS,
+@@ -709,10 +745,53 @@
+ 
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
++    case CALIBRATE_GET_MEAN:
++      elan_run_cmd (ssm, dev, &get_calib_mean_cmd, ELAN_CMD_TIMEOUT);
++      break;
++
++    case CALIBRATE_STORE_MEAN:
++      if (self->last_read)
++        self->calib_mean = self->last_read[0] * 0xff + self->last_read[1];
++      self->bg_attempts = 0;
++      fpi_ssm_next_state (ssm);
++      break;
++
+     case CALIBRATE_GET_BACKGROUND:
+       elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
+       break;
+ 
++    case CALIBRATE_CHECK_BACKGROUND:
++      {
++        const guint16 *px = (const guint16 *) self->last_read;
++        guint32 n = (guint32) self->frame_width * self->raw_frame_height;
++        guint64 sum = 0;
++        guint32 mean, delta;
++
++        for (guint32 i = 0; i < n; i++)
++          sum += GUINT16_FROM_LE (px[i]);
++        mean = n ? (guint32) (sum / n) : 0;
++        delta = mean > self->calib_mean ? mean - self->calib_mean
++                                        : self->calib_mean - mean;
++        fp_dbg ("background mean: %u, device calib mean: %u, delta: %u",
++                mean, self->calib_mean, delta);
++
++        /* A finger that is still resting on the sensor right after the
++         * previous swipe shows up as a much brighter background; using it
++         * corrupts the next image. Wait a bit and grab it again. */
++        if (self->calib_mean != 0 && delta > 400 && self->bg_attempts < 4)
++          {
++            self->bg_attempts++;
++            fp_dbg ("background looks contaminated, retrying");
++            fpi_ssm_jump_to_state_delayed (ssm, CALIBRATE_GET_BACKGROUND, 800);
++          }
++        else
++          {
++            self->bg_attempts = 0;
++            fpi_ssm_next_state (ssm);
++          }
++      }
++      break;
++
+     case CALIBRATE_SAVE_BACKGROUND:
+       elan_save_background (self);
+       if (!elan_supports_calibration (self))
+@@ -726,10 +805,6 @@
+         }
+       break;
+ 
+-    case CALIBRATE_GET_MEAN:
+-      elan_run_cmd (ssm, dev, &get_calib_mean_cmd, ELAN_CMD_TIMEOUT);
+-      break;
+-
+     case CALIBRATE_CHECK_NEEDED:
+       if (elan_need_calibration (self))
+         {
+@@ -944,6 +1019,10 @@
+       break;
+     }
+ 
++  /* Swipe images from this small sensor are noisy; the stock threshold of 40
++   * rejects valid matches. */
++  fpi_image_device_set_bz3_threshold (dev, 15);
++
+   fpi_image_device_open_complete (dev, NULL);
+ }
+ 
+diff -ruN a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
+--- a/libfprint/drivers/elan.h	2026-10-30 00:21:13.792923758 +0800
++++ b/libfprint/drivers/elan.h	2026-10-30 00:21:13.793654828 +0800
+@@ -216,7 +216,7 @@
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c31, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c32, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c33, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c3d, .driver_data = ELAN_ALL_DEV},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0c3d, .driver_data = ELAN_NOT_ROTATED},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c42, .driver_data = ELAN_0C42},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4b, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
+diff -ruN a/libfprint/fpi-print.c b/libfprint/fpi-print.c
+--- a/libfprint/fpi-print.c	2026-10-30 00:21:13.796656656 +0800
++++ b/libfprint/fpi-print.c	2026-10-30 00:21:13.797379585 +0800
+@@ -201,6 +201,7 @@
+ 
+   xyt = g_new0 (struct xyt_struct, 1);
+   minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
++  fp_dbg ("print minutiae: %d (image %dx%d)", xyt->nrows, image->width, image->height);
+   g_ptr_array_add (print->prints, xyt);
+ 
+   g_clear_object (&print->image);
+@@ -252,6 +253,8 @@
+ 
+   pstruct = g_ptr_array_index (print->prints, 0);
+   probe_len = bozorth_probe_init (pstruct);
++  fp_dbg ("probe minutiae: %d, templates: %d", pstruct->nrows,
++          print_template->prints->len);
+ 
+   for (i = 0; i < print_template->prints->len; i++)
+     {
+@@ -259,7 +262,8 @@
+       gint score;
+       gstruct = g_ptr_array_index (print_template->prints, i);
+       score = bozorth_to_gallery (probe_len, pstruct, gstruct);
+-      fp_dbg ("score %d/%d", score, bz3_threshold);
++      fp_dbg ("score %d/%d (template minutiae %d)", score, bz3_threshold,
++              gstruct->nrows);
+ 
+       if (score >= bz3_threshold)
+         return FPI_MATCH_SUCCESS;
